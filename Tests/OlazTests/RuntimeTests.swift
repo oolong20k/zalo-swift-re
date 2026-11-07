@@ -139,3 +139,90 @@ import Foundation
         }
     }
 }
+
+@MainActor
+@Suite struct QRLoginStateTests {
+    private let pollURL = URL(string: "https://qr-id.zaloapp.com/polling/qr/waiting")!
+
+    @Test func decodeDataURLSupportsBase64AndPercentEncodedSVG() {
+        let rawPNG = Data([0x89, 0x50, 0x4E, 0x47])
+        let base64URL = "data:image/png;base64," + rawPNG.base64EncodedString()
+        #expect(ZaloEngine.decodeDataURL(base64URL) == rawPNG)
+
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/></svg>"
+        let encodedSVG = svg.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        let svgURL = "data:image/svg+xml;utf8," + encodedSVG
+        let decoded = ZaloEngine.decodeDataURL(svgURL)
+        #expect(decoded.flatMap { String(data: $0, encoding: .utf8) } == svg)
+    }
+
+    @Test func multiLayerQR2RotationAndTransientCodesStayWaitingScan() throws {
+        let engine = ZaloEngine()
+        engine.phase = .login(ZaloEngine.LoginState())
+        let firstSVG = "data:image/svg+xml;utf8,%3Csvg%20id%3D%22qr1%22%2F%3E"
+        let secondSVG = "data:image/svg+xml;utf8,%3Csvg%20id%3D%22qr2%22%2F%3E"
+
+        // Initial QR1 arrives
+        engine.handle(state: ["page": "login", "event": "qr", "qr": firstSVG])
+        guard case .login(let s1) = engine.phase else { Issue.record("expected .login"); return }
+        #expect(s1.step == .waitingScan)
+        #expect(String(data: s1.qrPNG ?? Data(), encoding: .utf8) == "<svg id=\"qr1\"/>")
+
+        // Server returns error_code = -20 ("Vui lòng thử lại QR mới.") to trigger second-layer QR
+        let pollMinus20 = try JSONSerialization.data(withJSONObject: [
+            "error_code": -20,
+            "error_message": "Vui lòng thử lại QR mới.",
+            "data": ["qr_cnt": "token2", "base64_qr": ""],
+        ])
+        engine.observe(url: pollURL, status: 200, body: pollMinus20)
+        guard case .login(let s2) = engine.phase else { Issue.record("expected .login"); return }
+        #expect(s2.step == .waitingScan)
+
+        // Official client finishes genSecondQR and posts event = "qr2"
+        engine.handle(state: ["page": "login", "event": "qr2", "qr": secondSVG])
+        guard case .login(let s3) = engine.phase else { Issue.record("expected .login"); return }
+        #expect(s3.step == .waitingScan)
+        #expect(String(data: s3.qrPNG ?? Data(), encoding: .utf8) == "<svg id=\"qr2\"/>")
+
+        // Transient 18010 status keeps waitingScan
+        let poll18010 = try JSONSerialization.data(withJSONObject: [
+            "error_code": 18010,
+            "error_message": "Waiting...",
+        ])
+        engine.observe(url: pollURL, status: 200, body: poll18010)
+        if case .login(let s4) = engine.phase {
+            #expect(s4.step == .waitingScan)
+        } else {
+            Issue.record("expected .login")
+        }
+
+        // User scans QR2 → display_name arrives → waitingConfirm
+        let pollScanned = try JSONSerialization.data(withJSONObject: [
+            "error_code": 0,
+            "data": ["display_name": "Nguyen Van A", "avatar": "https://s120-ava-talk.zadn.vn/a.jpg"],
+        ])
+        engine.observe(url: pollURL, status: 200, body: pollScanned)
+        if case .login(let s5) = engine.phase {
+            #expect(s5.step == .waitingConfirm(name: "Nguyen Van A", avatar: URL(string: "https://s120-ava-talk.zadn.vn/a.jpg")))
+        } else {
+            Issue.record("expected .login")
+        }
+    }
+
+    @Test func relinkFailureAndTimeoutTransitionToExpired() throws {
+        let engine = ZaloEngine()
+        engine.phase = .login(ZaloEngine.LoginState())
+        engine.handle(state: ["page": "login", "event": "qr", "qr": "data:image/svg+xml;utf8,%3Csvg%2F%3E"])
+
+        let pollMinus21 = try JSONSerialization.data(withJSONObject: [
+            "error_code": -21,
+            "error_message": "Relink failed",
+        ])
+        engine.observe(url: pollURL, status: 200, body: pollMinus21)
+        if case .login(let state) = engine.phase {
+            #expect(state.step == .expired)
+        } else {
+            Issue.record("expected .login")
+        }
+    }
+}

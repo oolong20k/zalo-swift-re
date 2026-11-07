@@ -65,7 +65,7 @@ final class ZaloEngine {
         var displayName: String { name.isEmpty ? (isGroup ? "Nhóm" : "Người dùng Zalo") : name }
     }
 
-    private(set) var phase: Phase = .starting
+    internal(set) var phase: Phase = .starting
     private(set) var conversations: [ConversationSummary] = []
     private(set) var profile: Profile?
     /// Why the session ended, shown on the login screen (e.g. kicked by another PC login).
@@ -330,16 +330,20 @@ final class ZaloEngine {
         }
     }
 
-    private func handle(state: [String: Any]) {
+    internal func handle(state: [String: Any]) {
         EngineLog.shared.write("state page=\(state["page"] ?? "-") event=\(state["event"] ?? "-") keys=\(state.keys.sorted())")
         switch state["page"] as? String {
         case "login":
             guard case .login(var login) = phase else { return }
             if let qr = state["qr"] as? String, let png = Self.decodeDataURL(qr) {
                 login.qrPNG = png
-                if state["event"] as? String == "qr" { login.step = .waitingScan }
+                let event = state["event"] as? String
+                if event == "qr" || event == "qr2" { login.step = .waitingScan }
                 phase = .login(login)
                 scheduleExpiry()
+            } else if (state["invalid"] as? NSNumber)?.boolValue == true, case .waitingScan = login.step {
+                login.step = .expired
+                phase = .login(login)
             }
         case "main" where state["convActions"] != nil:
             handleConversationActions(state: state)
@@ -384,7 +388,7 @@ final class ZaloEngine {
 
     /// The QR login long-polls (`qr-id.zaloapp.com/polling/qr/*`) pass through
     /// Swift's proxy; the official client handles them, we just mirror progress.
-    private func observe(url: URL, status: Int, body: Data) {
+    internal func observe(url: URL, status: Int, body: Data) {
         if url.path().hasSuffix("/api/session/kickout-info") {
             // The server signed this session out — Zalo allows one desktop (PC) session per account.
             EngineLog.shared.write("session kicked by server")
@@ -399,7 +403,15 @@ final class ZaloEngine {
         if let name = data["display_name"] as? String, !name.isEmpty {
             login.step = .waitingConfirm(name: name, avatar: (data["avatar"] as? String).flatMap(URL.init(string:)))
             phase = .login(login)
-        } else if code != 0, let message = json["error_message"] as? String, !message.isEmpty {
+        } else if code == -20 || code == 18010 || data["base64_qr"] != nil {
+            // Multi-layer QR rotation (`-20` → `genSecondQR` delivers the new SVG/PNG) or transient poll continuation (`18010`).
+            login.step = .waitingScan
+            phase = .login(login)
+        } else if code == -21 || code == 408 {
+            // `-21`: QR2 relink failed (the official client clears stale link history); `408`: QR timed out.
+            login.step = .expired
+            phase = .login(login)
+        } else if code != 0, let message = (json["error_message_localize"] as? String) ?? (json["error_message"] as? String), !message.isEmpty {
             login.step = .failed(message)
             phase = .login(login)
         }
@@ -493,6 +505,11 @@ final class ZaloEngine {
 
     static func decodeDataURL(_ url: String) -> Data? {
         guard url.hasPrefix("data:"), let comma = url.firstIndex(of: ",") else { return nil }
-        return Data(base64Encoded: String(url[url.index(after: comma)...]))
+        let header = url[..<comma]
+        let payload = String(url[url.index(after: comma)...])
+        if header.contains(";base64") {
+            return Data(base64Encoded: payload)
+        }
+        return (payload.removingPercentEncoding ?? payload).data(using: .utf8)
     }
 }
